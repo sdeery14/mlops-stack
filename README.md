@@ -4,6 +4,26 @@ Local development environment for **MLflow 3.4.0** (model tracking) and **Langfu
 
 > **Note**: The Langfuse configuration follows the [official docker-compose.yml structure](https://github.com/langfuse/langfuse/blob/main/docker-compose.yml) for best practices and compatibility.
 
+## Why Two Services?
+
+This stack uses **Langfuse for tracing** and **MLflow for model management** because each excels at different tasks:
+
+**Langfuse** - LLM Observability & Tracing:
+- ✅ **Native async support**: Designed for modern async agent workflows (OpenAI Agents SDK, LangGraph, etc.)
+- ✅ **Rich LLM traces**: Captures nested spans, function calls, streaming responses, and token usage automatically
+- ✅ **No race conditions**: Handles concurrent agent executions without duplicate key errors
+- ✅ **Built-in evaluations**: Supports human feedback, automated scoring, and A/B testing
+- ✅ **Cost tracking**: Automatic token counting and cost calculation per trace
+
+**MLflow** - Experiment Tracking & Model Registry:
+- ✅ **Model versioning**: Complete model lifecycle management and registry
+- ✅ **Artifact storage**: Centralized storage for models, plots, and datasets
+- ✅ **Experiment comparison**: Compare runs across different model architectures
+- ✅ **Production deployment**: Model serving and deployment integrations
+- ✅ **Industry standard**: Widely adopted with extensive integrations
+
+**In practice**: Use Langfuse's `@observe` decorator for detailed LLM traces, and MLflow's `start_run()` for experiment metadata and model artifacts. This gives you the best of both worlds without the limitations of `mlflow.openai.autolog()` (which doesn't support async agents).
+
 ## Quick Reference
 
 | Service | URL | Default Credentials |
@@ -116,29 +136,68 @@ docker-compose build --no-cache
 
 ## Usage Examples
 
-**MLflow:**
+### Langfuse for Tracing (Recommended for OpenAI Agents SDK)
+
 ```python
 import mlflow
+import asyncio
+from agents import Agent, Runner
+from langfuse.decorators import observe, langfuse_context
 
+# Setup
 mlflow.set_tracking_uri("http://localhost:5000")
 mlflow.set_experiment("my-experiment")
 
-with mlflow.start_run():
-    mlflow.log_param("param1", 5)
-    mlflow.log_metric("metric1", 0.85)
+@observe()  # Langfuse handles async agent tracing automatically
+async def run_agent(user_input: str):
+    agent = Agent(
+        name="Assistant",
+        instructions="You are a helpful assistant.",
+    )
+    result = await Runner.run(agent, user_input)
+    return result
+
+async def main():
+    with mlflow.start_run() as run:
+        # Langfuse captures detailed traces
+        result = await run_agent("What is machine learning?")
+        
+        # MLflow logs experiment metadata
+        mlflow.log_param("user_input", "What is machine learning?")
+        mlflow.log_text(result.final_output, "output.txt")
+        
+        # Link traces between systems
+        langfuse_context.update_current_trace(
+            metadata={"mlflow_run_id": run.info.run_id}
+        )
+        
+        langfuse_context.flush()
+
+asyncio.run(main())
 ```
 
-**Langfuse:**
+**Why not `mlflow.openai.autolog()`?** It doesn't support the async OpenAI Agents SDK and causes duplicate key errors due to race conditions.
+
+### MLflow for Model Tracking
+
 ```python
-from langfuse import Langfuse
+import mlflow
+from sklearn.ensemble import RandomForestClassifier
 
-langfuse = Langfuse(
-    public_key="<your-public-key>",
-    secret_key="<your-secret-key>",
-    host="http://localhost:3000"
-)
+mlflow.set_tracking_uri("http://localhost:5000")
+mlflow.set_experiment("my-ml-experiment")
 
-trace = langfuse.trace(name="my-llm-app")
+with mlflow.start_run():
+    # Train model
+    model = RandomForestClassifier()
+    model.fit(X_train, y_train)
+    
+    # Log parameters and metrics
+    mlflow.log_param("n_estimators", 100)
+    mlflow.log_metric("accuracy", 0.95)
+    
+    # Log model to registry
+    mlflow.sklearn.log_model(model, "model")
 ```
 
 ## License
