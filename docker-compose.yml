@@ -7,6 +7,7 @@ services:
   mlflow-db:
     image: postgres:16
     container_name: mlflow-postgres
+    restart: always
     environment:
       POSTGRES_DB: ${MLFLOW_DB_NAME:-mlflow}
       POSTGRES_USER: ${MLFLOW_DB_USER:-mlflow}
@@ -27,6 +28,7 @@ services:
       context: .
       dockerfile: Dockerfile.mlflow
     container_name: mlflow-server
+    restart: always
     depends_on:
       mlflow-db:
         condition: service_healthy
@@ -47,7 +49,6 @@ services:
       --default-artifact-root ${MLFLOW_ARTIFACT_ROOT:-/mlflow/artifacts}
       --host 0.0.0.0
       --port 5000
-    restart: unless-stopped
 
   # ===================================
   # Langfuse Stack (following official docker-compose.yml)
