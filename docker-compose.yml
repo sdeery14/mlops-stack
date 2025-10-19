@@ -1,233 +1,139 @@
+volumes:
+  mlflow-postgres-data:
+  mlflow-postgres-auth-data:
+  mlflow-minio-data:
+
 services:
-  # ===================================
-  # MLflow Stack
-  # ===================================
-  
-  # MLflow PostgreSQL Database
-  mlflow-db:
-    image: postgres:16
+  mlflow-postgres:
+    image: postgres:15
     container_name: mlflow-postgres
-    restart: always
     environment:
-      POSTGRES_DB: ${MLFLOW_DB_NAME:-mlflow}
-      POSTGRES_USER: ${MLFLOW_DB_USER:-mlflow}
-      POSTGRES_PASSWORD: ${MLFLOW_DB_PASSWORD:-mlflow}
+      POSTGRES_USER: ${MLFLOW_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${MLFLOW_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${MLFLOW_POSTGRES_DB}
     volumes:
-      - mlflow-db-data:/var/lib/postgresql/data
-    networks:
-      - mlops-network
+      - mlflow-postgres-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${MLFLOW_DB_USER:-mlflow}"]
+      test: ["CMD-SHELL", "pg_isready -U ${MLFLOW_POSTGRES_USER}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  mlflow-postgres-auth:
+    image: postgres:15
+    container_name: mlflow-postgres-auth
+    environment:
+      POSTGRES_USER: ${MLFLOW_POSTGRES_AUTH_USER}
+      POSTGRES_PASSWORD: ${MLFLOW_POSTGRES_AUTH_PASSWORD}
+      POSTGRES_DB: ${MLFLOW_POSTGRES_AUTH_DB}
+    volumes:
+      - mlflow-postgres-auth-data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${MLFLOW_POSTGRES_AUTH_USER}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  mlflow-minio:
+    image: minio/minio:latest
+    container_name: mlflow-minio
+    environment:
+      MINIO_ROOT_USER: ${MLFLOW_MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MLFLOW_MINIO_ROOT_PASSWORD}
+    volumes:
+      - mlflow-minio-data:/data
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${MLFLOW_MINIO_PORT}/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  mlflow-create-bucket:
+    image: minio/mc:latest
+    container_name: mlflow-create-bucket
+    depends_on:
+      mlflow-minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c '
+        mc alias set myminio http://${MLFLOW_MINIO_HOST}:${MLFLOW_MINIO_PORT} \
+          ${MLFLOW_MINIO_ROOT_USER} ${MLFLOW_MINIO_ROOT_PASSWORD} &&
+        mc mb --ignore-existing myminio/${MLFLOW_MINIO_BUCKET}
+      '
+    restart: "no"
+
+  mlflow-server:
+    image: ghcr.io/mlflow/mlflow:${MLFLOW_VERSION}
+    container_name: mlflow-server
+    depends_on:
+      mlflow-postgres:
+        condition: service_healthy
+      mlflow-postgres-auth:
+        condition: service_healthy
+      mlflow-minio:
+        condition: service_healthy
+      mlflow-create-bucket:
+        condition: service_completed_successfully
+    volumes:
+      - ./mlflow_auth_config.ini.template:/mlflow/mlflow_auth_config.ini.template:ro
+    environment:
+      # Backend store URI
+      MLFLOW_BACKEND_STORE_URI: ${MLFLOW_BACKEND_STORE_URI}
+
+      # S3/MinIO settings
+      MLFLOW_S3_ENDPOINT_URL: ${MLFLOW_S3_ENDPOINT_URL}
+      AWS_ACCESS_KEY_ID: ${MLFLOW_MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MLFLOW_MINIO_ROOT_PASSWORD}
+      AWS_DEFAULT_REGION: ${MLFLOW_AWS_DEFAULT_REGION}
+      MLFLOW_S3_IGNORE_TLS: "true"
+
+      # Server host/port
+      MLFLOW_HOST: ${MLFLOW_HOST}
+      MLFLOW_PORT: ${MLFLOW_PORT}
+
+      # Authentication settings
+      MLFLOW_FLASK_SERVER_SECRET_KEY: ${MLFLOW_FLASK_SERVER_SECRET_KEY}
+      MLFLOW_AUTH_CONFIG_PATH: /mlflow/mlflow_auth_config.ini
+      
+      # Auth database credentials (for envsubst)
+      MLFLOW_POSTGRES_AUTH_USER: ${MLFLOW_POSTGRES_AUTH_USER}
+      MLFLOW_POSTGRES_AUTH_PASSWORD: ${MLFLOW_POSTGRES_AUTH_PASSWORD}
+      MLFLOW_POSTGRES_AUTH_DB: ${MLFLOW_POSTGRES_AUTH_DB}
+      MLFLOW_ADMIN_USERNAME: ${MLFLOW_ADMIN_USERNAME}
+      MLFLOW_ADMIN_PASSWORD: ${MLFLOW_ADMIN_PASSWORD}
+      
+      # Force gunicorn server
+      GUNICORN_CMD_ARGS: "--bind=0.0.0.0:5000 --workers=1"
+
+    command: >
+      /bin/bash -c "
+        apt-get update && apt-get install -y gettext-base &&
+        pip install --no-cache-dir psycopg2-binary boto3 'mlflow[auth]' &&
+        envsubst < /mlflow/mlflow_auth_config.ini.template > /mlflow/mlflow_auth_config.ini &&
+        gunicorn -b 0.0.0.0:5000 -w 1 'mlflow.server.auth:create_app()'
+      "
+    ports:
+      - "${MLFLOW_PORT}:${MLFLOW_PORT}"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:${MLFLOW_PORT}/health')",
+        ]
       interval: 10s
       timeout: 5s
-      retries: 5
-
-  # MLflow Server
-  mlflow:
-    build:
-      context: .
-      dockerfile: Dockerfile.mlflow
-    container_name: mlflow-server
-    restart: always
-    depends_on:
-      mlflow-db:
-        condition: service_healthy
-    environment:
-      MLFLOW_BACKEND_STORE_URI: postgresql://${MLFLOW_DB_USER:-mlflow}:${MLFLOW_DB_PASSWORD:-mlflow}@mlflow-db:5432/${MLFLOW_DB_NAME:-mlflow}
-      MLFLOW_ARTIFACT_ROOT: ${MLFLOW_ARTIFACT_ROOT:-/mlflow/artifacts}
-      MLFLOW_TRACKING_USERNAME: ${MLFLOW_TRACKING_USERNAME:-admin}
-      MLFLOW_TRACKING_PASSWORD: ${MLFLOW_TRACKING_PASSWORD:-password}
-    volumes:
-      - mlflow-artifacts:/mlflow/artifacts
-    ports:
-      - "${MLFLOW_PORT:-5000}:5000"
-    networks:
-      - mlops-network
-    command: >
-      mlflow server
-      --backend-store-uri postgresql://${MLFLOW_DB_USER:-mlflow}:${MLFLOW_DB_PASSWORD:-mlflow}@mlflow-db:5432/${MLFLOW_DB_NAME:-mlflow}
-      --default-artifact-root ${MLFLOW_ARTIFACT_ROOT:-/mlflow/artifacts}
-      --host 0.0.0.0
-      --port 5000
-
-  # ===================================
-  # Langfuse Stack (following official docker-compose.yml)
-  # ===================================
-  
-  # Langfuse Worker (Async Processing)
-  langfuse-worker:
-    image: docker.io/langfuse/langfuse-worker:3
-    container_name: langfuse-worker
-    restart: always
-    depends_on: &langfuse-depends-on
-      postgres:
-        condition: service_healthy
-      minio:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      clickhouse:
-        condition: service_healthy
-    environment: &langfuse-worker-env
-      # Database
-      DATABASE_URL: ${DATABASE_URL:-postgresql://langfuse:langfuse@postgres:5432/langfuse}
-      
-      # Security
-      SALT: ${SALT:-changeme}  # CHANGEME: generate via `openssl rand -base64 32`
-      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-0000000000000000000000000000000000000000000000000000000000000000}  # CHANGEME: generate via `openssl rand -hex 32`
-      
-      # Features
-      TELEMETRY_ENABLED: ${TELEMETRY_ENABLED:-true}
-      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: ${LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES:-true}
-      
-      # ClickHouse
-      CLICKHOUSE_MIGRATION_URL: ${CLICKHOUSE_MIGRATION_URL:-clickhouse://clickhouse:9000}
-      CLICKHOUSE_URL: ${CLICKHOUSE_URL:-http://clickhouse:8123}
-      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
-      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}  # CHANGEME
-      CLICKHOUSE_CLUSTER_ENABLED: ${CLICKHOUSE_CLUSTER_ENABLED:-false}
-      
-      # MinIO/S3 - Event Upload
-      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: ${LANGFUSE_S3_EVENT_UPLOAD_BUCKET:-langfuse}
-      LANGFUSE_S3_EVENT_UPLOAD_REGION: ${LANGFUSE_S3_EVENT_UPLOAD_REGION:-auto}
-      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID:-minio}
-      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY:-miniosecret}  # CHANGEME
-      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: ${LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT:-http://minio:9000}
-      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: ${LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE:-true}
-      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: ${LANGFUSE_S3_EVENT_UPLOAD_PREFIX:-events/}
-      
-      # MinIO/S3 - Media Upload
-      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: ${LANGFUSE_S3_MEDIA_UPLOAD_BUCKET:-langfuse}
-      LANGFUSE_S3_MEDIA_UPLOAD_REGION: ${LANGFUSE_S3_MEDIA_UPLOAD_REGION:-auto}
-      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID:-minio}
-      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY:-miniosecret}  # CHANGEME
-      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: ${LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT:-http://localhost:9090}
-      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: ${LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE:-true}
-      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: ${LANGFUSE_S3_MEDIA_UPLOAD_PREFIX:-media/}
-      
-      # Redis
-      REDIS_HOST: ${REDIS_HOST:-redis}
-      REDIS_PORT: ${REDIS_PORT:-6379}
-      REDIS_AUTH: ${REDIS_AUTH:-myredissecret}  # CHANGEME
-    networks:
-      - mlops-network
-
-  # Langfuse Web Application
-  langfuse-web:
-    image: docker.io/langfuse/langfuse:3
-    container_name: langfuse-web
-    restart: always
-    depends_on: *langfuse-depends-on
-    ports:
-      - "${LANGFUSE_PORT:-3000}:3000"
-    environment:
-      <<: *langfuse-worker-env
-      NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3000}
-      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-mysecret}  # CHANGEME: generate via `openssl rand -base64 32`
-      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-}
-      LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME:-}
-      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:-}
-      LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME:-}
-      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY:-}
-      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY:-}
-      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-}
-      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-}
-      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-}
-    networks:
-      - mlops-network
-
-  # PostgreSQL Database
-  postgres:
-    image: postgres:16
-    container_name: langfuse-postgres
-    restart: always
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB:-langfuse}
-      POSTGRES_USER: ${POSTGRES_USER:-langfuse}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-langfuse}  # CHANGEME
-    volumes:
-      - langfuse-db-data:/var/lib/postgresql/data
-    networks:
-      - mlops-network
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-langfuse}"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-      start_period: 1s
-
-  # ClickHouse Database (Analytics/OLAP)
-  clickhouse:
-    image: clickhouse/clickhouse-server:24.10
-    container_name: langfuse-clickhouse
-    restart: always
-    environment:
-      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-default}
-      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
-      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}  # CHANGEME
-      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
-    volumes:
-      - langfuse-clickhouse-data:/var/lib/clickhouse
-    networks:
-      - mlops-network
-    healthcheck:
-      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-      start_period: 1s
-
-  # MinIO (S3-compatible Object Storage)
-  minio:
-    image: docker.io/minio/minio
-    container_name: langfuse-minio
-    restart: always
-    entrypoint: sh
-    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-miniosecret}  # CHANGEME
-    ports:
-      - "9090:9000"
-      - "127.0.0.1:9091:9001"
-    volumes:
-      - langfuse-minio-data:/data
-    networks:
-      - mlops-network
-    healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
-      interval: 1s
-      timeout: 5s
-      retries: 5
-      start_period: 1s
-
-  # Redis (Cache & Queue)
-  redis:
-    image: docker.io/redis:7
-    container_name: langfuse-redis
-    restart: always
-    command: >
-      --requirepass ${REDIS_AUTH:-myredissecret}
-    ports:
-      - "127.0.0.1:6379:6379"
-    volumes:
-      - langfuse-redis-data:/data
-    networks:
-      - mlops-network
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 1s
-      timeout: 3s
-      retries: 5
+      retries: 30
 
 networks:
-  mlops-network:
-    driver: bridge
-
-volumes:
-  mlflow-db-data:
-  mlflow-artifacts:
-  langfuse-db-data:
-  langfuse-clickhouse-data:
-  langfuse-redis-data:
-  langfuse-minio-data:
+  default:
+    name: mlflow-network

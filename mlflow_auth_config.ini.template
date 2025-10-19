@@ -1,0 +1,18 @@
+[mlflow]
+# Default permission for all users on all resources
+# Options: READ, EDIT, MANAGE, NO_PERMISSIONS
+default_permission = READ
+
+# Database location to store authentication and permission data
+# Using a separate PostgreSQL database for auth (required for proper migrations)
+# This ensures auth data is centralized and survives container restarts
+database_uri = postgresql://${MLFLOW_POSTGRES_AUTH_USER}:${MLFLOW_POSTGRES_AUTH_PASSWORD}@mlflow-postgres-auth:5432/${MLFLOW_POSTGRES_AUTH_DB}
+
+# Default admin credentials (only used if admin doesn't already exist)
+# IMPORTANT: Change these in your .env file after first login
+admin_username = ${MLFLOW_ADMIN_USERNAME}
+admin_password = ${MLFLOW_ADMIN_PASSWORD}
+
+# Authorization function (default: HTTP Basic Auth)
+# Leave commented to use default basic auth
+# authorization_function = custom_module:custom_auth_function
