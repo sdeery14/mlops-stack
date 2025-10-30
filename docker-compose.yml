@@ -127,7 +127,12 @@ services:
         apt-get update && apt-get install -y gettext-base &&
         pip install --no-cache-dir psycopg2-binary boto3 'mlflow[auth]' &&
         envsubst < /mlflow/mlflow_auth_config.ini.template > /mlflow/mlflow_auth_config.ini &&
-        gunicorn -b 0.0.0.0:5000 -w 1 'mlflow.server.auth:create_app()'
+        mlflow server 
+          --host 0.0.0.0 
+          --port 5000 
+          --backend-store-uri ${MLFLOW_BACKEND_STORE_URI} 
+          --default-artifact-root ${MLFLOW_DEFAULT_ARTIFACT_ROOT} 
+          --app-name basic-auth
       "
     ports:
       - "${MLFLOW_PORT}:${MLFLOW_PORT}"
